@@ -2,8 +2,10 @@ import fitz  # PyMuPDF
 import spacy
 import json
 import re
-import argparse
 import string
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
 
 # Load spaCy model
 nlp = spacy.load("en_core_web_sm")
@@ -32,7 +34,6 @@ tech_jobs_skills = {
     "Technical Support Engineer": ["Troubleshooting", "Linux", "Windows", "Networking", "Customer Support", "Scripting"]
 }
 
-# Headings to look for and their max points
 HEADINGS = {
     "skill": 17,
     "experience": 17,
@@ -45,9 +46,9 @@ LENGTH_MAX_POINTS = 15
 TOKEN_LOWER_THRESHOLD = 150
 TOKEN_UPPER_THRESHOLD = 600
 
-def extract_text_from_pdf(pdf_path):
+def extract_text_from_pdf(pdf_file):
     text = ""
-    with fitz.open(pdf_path) as doc:
+    with fitz.open(stream=pdf_file.read(), filetype="pdf") as doc:
         for page in doc:
             text += page.get_text()
     return text
@@ -189,24 +190,20 @@ def clean_job_title(job_title: str) -> str:
 
 def analyze_resume(full_text):
     total_points = 100
-    heading_points_total = sum(HEADINGS.values())  # 85 points
+    heading_points_total = sum(HEADINGS.values())
     results_msgs = []
 
-    # Extract job title and clean it
     job_title_raw = extract_job_title(full_text)
     job_title = clean_job_title(job_title_raw)
 
-    # Token length scoring
     tokens = simple_tokenize(full_text)
     length_score, length_msg, token_count = score_length_by_tokens(tokens)
 
-    # Split sections
     sections = split_sections_by_headings(full_text, HEADINGS.keys())
 
     heading_scores = {}
     total_heading_score_weighted = 0
 
-    # Analyze each heading section if present, otherwise 0 score and message
     for heading, max_points in HEADINGS.items():
         section_content = sections.get(heading, "")
         if section_content:
@@ -220,47 +217,44 @@ def analyze_resume(full_text):
 
         total_heading_score_weighted += heading_scores[heading]
 
-    # Job title skill comparison and deduction or assign 14 points if unknown title
     if job_title and job_title in tech_jobs_skills:
         required_skills = tech_jobs_skills[job_title]
         skills_section = sections.get("skill", "").lower() if "skill" in sections else ""
         skills_found = [sk for sk in required_skills if sk.lower() in skills_section]
         missing_skills = set(required_skills) - set(skills_found)
         for skill in missing_skills:
-            total_heading_score_weighted -= 2  # Deduct 2 points per missing skill
+            total_heading_score_weighted -= 2
             results_msgs.append(f"Missing required skill for {job_title}: {skill}")
     else:
-        # Unknown job title: assign 14 points instead of skill heading points
-        # Remove skill heading points contribution if any
         skill_points = HEADINGS.get("skill", 0)
         total_heading_score_weighted -= skill_points
         total_heading_score_weighted += 14
 
-    # Cap heading score to max possible and not below zero
-    if total_heading_score_weighted > heading_points_total:
-        total_heading_score_weighted = heading_points_total
-    if total_heading_score_weighted < 0:
-        total_heading_score_weighted = 0
+    total_heading_score_weighted = max(min(total_heading_score_weighted, heading_points_total), 0)
 
-    # Combine heading score with length score
     final_score = total_heading_score_weighted + length_score
-    if final_score > total_points:
-        final_score = total_points
-    if final_score < 0:
-        final_score = 0
+    final_score = max(min(final_score, total_points), 0)
 
     results_msgs.append(length_msg)
-    # Only include final score and suggestions in output as requested
+
     return json.dumps({
         "score": round(final_score, 2),
         "suggestions": results_msgs
     }, indent=4)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Resume scorer and suggestion generator")
-    parser.add_argument("pdf_path", type=str, help="Path to the resume PDF file")
-    args = parser.parse_args()
+@app.route("/upload", methods=["POST"])
+def upload_pdf():
+    if "resume" not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    file = request.files["resume"]
+    if file.filename == "":
+        return jsonify({"error": "No selected file"}), 400
+    try:
+        full_text = extract_text_from_pdf(file)
+        result = analyze_resume(full_text)
+        return jsonify(json.loads(result))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    full_text = extract_text_from_pdf(args.pdf_path)
-    result = analyze_resume(full_text)
-    print(result)
+if __name__ == "__main__":
+    app.run(debug=True)
